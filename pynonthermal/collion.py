@@ -2,6 +2,7 @@ import math
 from functools import lru_cache
 from math import atan
 from pathlib import Path
+from numba import njit
 
 import numpy as np
 import numpy.typing as npt
@@ -9,7 +10,7 @@ import polars as pl
 
 import pynonthermal
 from pynonthermal.axelrod import get_binding_energies
-from pynonthermal.axelrod import get_lotz_xs_ionisation
+from pynonthermal.axelrod import get_lotz_xs_ionisation,get_lotz_xs_ionisation_vectorized
 from pynonthermal.axelrod import get_shell_configs
 from pynonthermal.constants import EV
 
@@ -203,6 +204,14 @@ def read_colliondata(collionfilename: str | Path = "collion.txt") -> pl.DataFram
 #        .sort(by=["Z", "ion_stage", "ionpot_ev", "n", "l"])
 #    )
 
+@njit(fastmath=True,cache=True)
+def jit_Psecondary(e_p: float, ionpot_ev: float, J: float, e_s: float = -1.0, epsilon: float = -1.0) -> float:
+    if e_s < 0:
+        e_s = epsilon - ionpot_ev
+    # Safeguard against unphysical regions where e_p <= ionpot_ev (avoids divide by zero in atan)
+    if e_p <= ionpot_ev:
+        return 0.0
+    return 1.0 / J / math.atan((e_p - ionpot_ev) / 2.0 / J) / (1.0 + ((e_s / J) ** 2))
 
 def Psecondary(e_p: float, ionpot_ev: float, J: float, e_s: float = -1, epsilon: float = -1) -> float:
     # probability distribution function for secondaries energy e_s [eV] (or equivalently the energy loss of
@@ -259,13 +268,42 @@ def ar_xs(energy_ev: float, ionpot_ev: float, A: float, B: float, C: float, D: f
         / (u * pow(ionpot_ev, 2))
     )
 
-
-def get_arxs_array_shell(arr_enev: npt.NDArray[np.float64], shell: dict[str, int | float]) -> npt.NDArray[np.float64]:
-    if shell["n"] < 0:
-        return np.array([get_lotz_xs_ionisation(shell, en_ev=en_ev) for en_ev in arr_enev])
-    return np.array(
-        [ar_xs(energy_ev, shell["ionpot_ev"], shell["A"], shell["B"], shell["C"], shell["D"]) for energy_ev in arr_enev]
+def ar_xs_vectorized(energy_ev_array: np.ndarray, ionpot_ev: float, A: float, B: float, C: float, D: float) -> np.ndarray:
+    # Use np.where to handle the u <= 1 case efficiently for the whole array
+    u = energy_ev_array / ionpot_ev 
+    #print('in vectorized call?')
+    # Calculate cross-section only where u > 1
+    # We use np.log instead of math.log to work on arrays
+    xs = (
+        1e-14
+        * (A * (1 - 1 / u) + B * (1 - 1 / u)**2 + C * np.log(u) + D * np.log(u) / u)
+        / (u * (ionpot_ev**2))
     )
+    
+    # Return 0 for energies below ionization potential
+    return np.where(u > 1, xs, 0.0)
+
+def get_arxs_array_shell(arr_enev: np.ndarray, shell: dict[str, int | float]) -> np.ndarray:
+    if shell["n"] < 0:
+        # If get_lotz_xs_ionisation is slow, you should vectorize it similarly
+        #return np.array([get_lotz_xs_ionisation(shell, en_ev=en_ev) for en_ev in arr_enev])
+        return get_lotz_xs_ionisation_vectorized(shell, arr_enev)
+    # The new vectorized call
+    return ar_xs_vectorized(
+        arr_enev, 
+        shell["ionpot_ev"], 
+        shell["A"], 
+        shell["B"], 
+        shell["C"], 
+        shell["D"]
+    )
+
+#def get_arxs_array_shell(arr_enev: npt.NDArray[np.float64], shell: dict[str, int | float]) -> npt.NDArray[np.float64]:
+#    if shell["n"] < 0:
+#        return np.array([get_lotz_xs_ionisation(shell, en_ev=en_ev) for en_ev in arr_enev])
+#    return np.array(
+#        [ar_xs(energy_ev, shell["ionpot_ev"], shell["A"], shell["B"], shell["C"], shell["D"]) for energy_ev in arr_enev]
+#    )
 
 
 def get_arxs_array_ion(

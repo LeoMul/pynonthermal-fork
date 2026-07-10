@@ -118,6 +118,69 @@ def get_workfn_ev(atomic_number: int, ion_stage: int, ionpot_ev: float, Zbar: fl
     return (1 / oneoverW) / EV
 
 
+#@njit(fastmath=True)
+#def jit_lotz_xs(en_ev, ionpot_ev, electronsinshell):
+#    # Use direct numeric constants instead of calling functions inside
+#    p = ionpot_ev * 1.602176634e-12 
+#    en_erg = en_ev * 1.602176634e-12
+#    
+#    if en_erg <= p:
+#        return 0.0
+#    
+#    betasq = (2.0 * en_erg / 9.1093837e-28) / (2.99792458e10**2)
+#    
+#    # Use math.log (natural log) for both terms
+#    # Replacing math.log10 with math.log for consistency (as per your code comment)
+#    part_sigma_shell = (electronsinshell / p) * (
+#        math.log(betasq * 9.1093837e-28 * (2.99792458e10**2) / 2.0 / p) - 
+#        math.log(1.0 - betasq) - betasq
+#    )
+#    
+#    if part_sigma_shell > 0:
+#        Aconst = 1.33e-14 * (1.602176634e-12**2)
+#        return 2.0 * Aconst / betasq / 9.1093837e-28 / (2.99792458e10**2) * part_sigma_shell
+#        
+#    return 0.0
+
+import numpy as np
+
+def get_lotz_xs_ionisation_vectorized(shell: dict[str, int | float], en_ev_array: np.ndarray) -> np.ndarray:
+    #print('in vectorized lotz call')
+    # 1. Convert constants to arrays/scalars suitable for math
+    ionpot_ev = shell["ionpot_ev"]
+    atomic_number = int(shell["Z"])
+    ion_stage = int(shell["ion_stage"])
+    ionpot_ev = shell["ionpot_ev"]
+    shellindex = -int(shell["l"])
+    
+    p = ionpot_ev * EV
+    en_erg_array = en_ev_array * EV
+    
+    # 2. Vectorized calculation of beta (works on the whole array at once)
+    # Note: Use np.sqrt instead of math.sqrt
+    beta_array = np.sqrt(2 * en_erg_array / ME) / CLIGHT
+    betasq_array = beta_array**2
+    electron_binding = get_binding_energies()
+    all_shells_q = get_shell_configs()
+    
+    # 3. Handle the condition (en_erg > p) for the whole array
+    # We use np.where to keep it fast and avoid if-else loops
+    
+    # Calculate log terms using np.log (natural log) and np.log10
+    log_term1 = np.log(betasq_array * ME * CLIGHT**2 / (2.0 * p))
+    log_term2 = np.log10(1.0 - betasq_array)
+    
+    electronsinshell = get_shell_occupancies(atomic_number, ion_stage, electron_binding, all_shells_q)[shellindex]
+
+    part_sigma_shell = (electronsinshell / p) * (log_term1 - log_term2 - betasq_array)
+    
+    # 4. Final computation
+    Aconst = 1.33e-14 * EV * EV
+    xs_array = 2 * Aconst / betasq_array / ME / (CLIGHT**2) * part_sigma_shell
+    
+    # Only return values where en_erg > p, else 0
+    return np.where(en_erg_array > p, xs_array, 0.0)
+
 def get_lotz_xs_ionisation(shell: dict[str, int | float], en_ev: float) -> float:
     # Axelrod 1980 Eq 3.38
 

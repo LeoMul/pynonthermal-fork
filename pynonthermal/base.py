@@ -10,8 +10,32 @@ from pynonthermal.constants import EV
 from pynonthermal.constants import H
 from pynonthermal.constants import ME
 from pynonthermal.constants import QE
+from numba import njit
 
 DATADIR = Path(__file__).absolute().parent / "data"
+
+@njit(fastmath=True,cache=True)
+def jit_electronlossfunction(energy_ev: float, n_e_cgs: float) -> float:
+    if energy_ev <= 0:
+        return 0.0
+    
+    energy = energy_ev * EV
+    omegap = 5.64e4 * math.sqrt(n_e_cgs)
+    zetae = H * omegap / 2.0 / math.pi
+
+    if energy_ev > 14.0:
+        if 2.0 * energy <= zetae:
+            return 0.0
+        lossfunc = n_e_cgs * 2.0 * math.pi * (QE**4) / energy * math.log(2.0 * energy / zetae)
+    else:
+        v = math.sqrt(2.0 * energy / ME)
+        eulergamma = 0.577215664901532
+        val_inside_log = (ME * (v**3)) / (eulergamma * (QE**2) * omegap)
+        if val_inside_log <= 0:
+            return 0.0
+        lossfunc = n_e_cgs * 2.0 * math.pi * (QE**4) / energy * math.log(val_inside_log)
+
+    return lossfunc / EV
 
 
 def electronlossfunction(energy_ev: float, n_e_cgs: float) -> float:

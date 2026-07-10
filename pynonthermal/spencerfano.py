@@ -50,6 +50,70 @@ SUBSHELLNAMES = [
     "P4",
     "Q1",
 ]
+
+@njit(cache=True, fastmath=True)
+def jit_get_J(Z, ion_stage, ionpot_ev):
+    if ion_stage == 1:
+        if Z == 2:
+            return 15.8
+        if Z == 10:
+            return 24.2
+        if Z == 18:
+            return 10.0
+    return 0.6 * ionpot_ev
+
+
+@njit(cache=True, fastmath=True)
+def jit_psecondary(e_p, ionpot_ev, J, epsilon):
+    e_s = epsilon - ionpot_ev
+    return 1.0 / J / math.atan((e_p - ionpot_ev) / 2.0 / J) / (1.0 + (e_s / J) ** 2)
+
+
+@njit(cache=True)
+def _searchsorted_right_minus1(arr, val):
+    return np.searchsorted(arr, val, side="right") - 1
+
+
+@njit(cache=True, fastmath=True)
+def shell_contribution_jit(engrid, yvec, ar_xs_array, arr_en_nz, ionpot_ev, J, deltaen):
+    npts = engrid.shape[0]
+    n_en = arr_en_nz.shape[0]
+    N_e_ion = np.zeros(n_en)
+    emax = engrid[-1]
+
+    integral1startindex = max(0, _searchsorted_right_minus1(engrid, ionpot_ev))
+
+    for a in range(n_en):
+        en_a = arr_en_nz[a]
+        acc = 0.0
+
+        # Integral 1: ionpot to enlambda
+        enlambda = min(emax - en_a, en_a + ionpot_ev)
+        integral2stopindex = _searchsorted_right_minus1(engrid, enlambda)
+
+        if integral2stopindex >= integral1startindex:
+            for j in range(integral1startindex, integral2stopindex + 1):
+                endash = engrid[j]
+                k = _searchsorted_right_minus1(engrid, en_a + endash)
+                k = max(0, min(k, npts - 1))
+                e_p = engrid[k]
+                if e_p > ionpot_ev:
+                    psec = jit_psecondary(e_p, ionpot_ev, J, endash)
+                    acc += deltaen * yvec[k] * ar_xs_array[k] * psec
+
+        # Integral 2: 2E + I to Emax
+        start_idx = max(0, _searchsorted_right_minus1(engrid, 2.0 * en_a + ionpot_ev))
+        epsilon_val = en_a + ionpot_ev
+        for j in range(start_idx, npts):
+            e_p = engrid[j]
+            if e_p > ionpot_ev:
+                psec2 = jit_psecondary(e_p, ionpot_ev, J, epsilon_val)
+                acc += deltaen * yvec[j] * ar_xs_array[j] * psec2
+
+        N_e_ion[a] = acc
+
+    return N_e_ion
+
 @njit(cache=True,fastmath=True)
 def jit_compute_ionisation_shell(sfmatrix, engrid, ionpot_ev, ar_xs_array, J, n_ion, deltaen, xsstartindex):
     """
@@ -681,9 +745,10 @@ class SpencerFanoSolver:
         arr_en, deltaen2 = np.linspace(0.0, E_0, num=npts_integral, retstep=True, endpoint=True, dtype=np.float64)
         
         # Passes the subgrid through our upgraded JIT-based calculate_N_e path!
+        timene = time.time()
         print('in calc n_e')
         arr_N_e = self.calculate_N_e(arr_en)
-        print('out of calc n_e')
+        print('out of calc n_e', time.time()-timene)
 
         arr_en_N_e = arr_en * arr_N_e
         
@@ -730,61 +795,80 @@ class SpencerFanoSolver:
             # --- Ionisation Shell Components ---
             dfcollion_thision = self.dfcollion.filter((pl.col("Z") == Z) & (pl.col("ion_stage") == ion_stage))
 
+            tshell = time.time()
+            
+            
             for shell in dfcollion_thision.to_dicts():
                 ionpot_ev = shell["ionpot_ev"]
-                J = pynonthermal.collion.get_J(int(shell["Z"]), int(shell["ion_stage"]), ionpot_ev)
-                ar_xs_array = np.array(pynonthermal.collion.get_arxs_array_shell(self.engrid, shell))
+                J = jit_get_J(int(shell["Z"]), int(shell["ion_stage"]), ionpot_ev)
+                shelltime = time.time()
+                ar_xs_array = np.asarray(pynonthermal.collion.get_arxs_array_shell(self.engrid, shell), dtype=np.float64)
+                #print(' get_arxs_array_shell time',time.time()-shelltime)
+                shelltime = time.time()
+                N_e_ion = shell_contribution_jit(
+                    self.engrid, self.yvec, ar_xs_array, arr_en_nz, ionpot_ev, J, deltaen
+                )
+                #print(' shell_contribution_jit time',time.time()-shelltime)
+                #todo - need to check where this is supposed to go.
+                N_e_tot[nonzero_mask] += n_ion * N_e_ion
+                
+            #print(' time in shell loop', time.time() - tshell,n_ion * N_e_ion)
 
-                # --- Integral 1 (ionpot to enlambda) ---
-                enlambda = np.minimum(self.engrid[-1] - arr_en_nz, arr_en_nz + ionpot_ev)
-                integral1startindex = max(0, np.searchsorted(self.engrid, ionpot_ev, side='right') - 1)
-                integral2stopindices = np.searchsorted(self.engrid, enlambda, side='right') - 1
-                
-                j_indices = np.arange(len(self.engrid))
-                j_mask = (j_indices >= integral1startindex) & (j_indices[np.newaxis, :] <= integral2stopindices[:, np.newaxis])
-                
-                if np.any(j_mask):
-                    endash_2d = self.engrid[np.newaxis, :]
-                    target_en = arr_en_nz[:, np.newaxis] + endash_2d
-                    k_idx = np.searchsorted(self.engrid, target_en, side='right') - 1
-                    k_idx = np.clip(k_idx, 0, len(self.engrid) - 1)
-                    
-                    e_p_2d = self.engrid[k_idx]
-                    epsilon_2d = np.broadcast_to(endash_2d, e_p_2d.shape)
-                    
-                    # CRITICAL FIX: Ensure Psecondary is only evaluated where e_p > ionpot_ev
-                    safe_eval_mask = j_mask & (e_p_2d > ionpot_ev)
-                    
-                    if np.any(safe_eval_mask):
-                        #v_Psec(e_p_2d[mask], ionpot_ev=ionpot_ev, J=J, epsilon=epsilon_2d[mask])
-                        valid_Psec = v_Psec(e_p_2d[safe_eval_mask], epsilon=epsilon_2d[safe_eval_mask],ionpot_ev= ionpot_ev, J=J)
-                        term1_full = np.zeros_like(e_p_2d)
-                        term1_full[safe_eval_mask] = deltaen * self.yvec[k_idx[safe_eval_mask]] * ar_xs_array[k_idx[safe_eval_mask]] * valid_Psec
-                        N_e_ion += np.sum(term1_full, axis=1)
-
-                # --- Integral 2 (2E + I to E_max) ---
-                target_start_en2 = 2 * arr_en_nz + ionpot_ev
-                integral2startindices = np.searchsorted(self.engrid, target_start_en2, side='right') - 1
-                integral2startindices = np.maximum(0, integral2startindices)
-                
-                j_mask2 = j_indices[np.newaxis, :] >= integral2startindices[:, np.newaxis]
-                
-                if np.any(j_mask2):
-                    e_p_2d = np.broadcast_to(self.engrid[np.newaxis, :], j_mask2.shape)
-                    epsilon_2d = np.broadcast_to((arr_en_nz + ionpot_ev)[:, np.newaxis], j_mask2.shape)
-                    
-                    # CRITICAL FIX: Maintain consistency safeguard for the second integral limits
-                    safe_eval_mask2 = j_mask2 & (e_p_2d > ionpot_ev)
-                    
-                    if np.any(safe_eval_mask2):
-                        valid_Psec2 = v_Psec(e_p_2d[safe_eval_mask2], epsilon=epsilon_2d[safe_eval_mask2], ionpot_ev=ionpot_ev, J=J)
-                        y_xs_2d = np.broadcast_to((self.yvec * ar_xs_array)[np.newaxis, :], j_mask2.shape)
-                        
-                        term2_full = np.zeros_like(e_p_2d)
-                        term2_full[safe_eval_mask2] = deltaen * y_xs_2d[safe_eval_mask2] * valid_Psec2
-                        N_e_ion += np.sum(term2_full, axis=1)
-
-            N_e_tot[nonzero_mask] += n_ion * N_e_ion
+            #for shell in dfcollion_thision.to_dicts():
+            #    ionpot_ev = shell["ionpot_ev"]
+            #    J = pynonthermal.collion.get_J(int(shell["Z"]), int(shell["ion_stage"]), ionpot_ev)
+            #    ar_xs_array = np.array(pynonthermal.collion.get_arxs_array_shell(self.engrid, shell))
+#
+            #    # --- Integral 1 (ionpot to enlambda) ---
+            #    enlambda = np.minimum(self.engrid[-1] - arr_en_nz, arr_en_nz + ionpot_ev)
+            #    integral1startindex = max(0, np.searchsorted(self.engrid, ionpot_ev, side='right') - 1)
+            #    integral2stopindices = np.searchsorted(self.engrid, enlambda, side='right') - 1
+            #    
+            #    j_indices = np.arange(len(self.engrid))
+            #    j_mask = (j_indices >= integral1startindex) & (j_indices[np.newaxis, :] <= integral2stopindices[:, np.newaxis])
+            #    
+            #    if np.any(j_mask):
+            #        endash_2d = self.engrid[np.newaxis, :]
+            #        target_en = arr_en_nz[:, np.newaxis] + endash_2d
+            #        k_idx = np.searchsorted(self.engrid, target_en, side='right') - 1
+            #        k_idx = np.clip(k_idx, 0, len(self.engrid) - 1)
+            #        
+            #        e_p_2d = self.engrid[k_idx]
+            #        epsilon_2d = np.broadcast_to(endash_2d, e_p_2d.shape)
+            #        
+            #        # CRITICAL FIX: Ensure Psecondary is only evaluated where e_p > ionpot_ev
+            #        safe_eval_mask = j_mask & (e_p_2d > ionpot_ev)
+            #        
+            #        if np.any(safe_eval_mask):
+            #            #v_Psec(e_p_2d[mask], ionpot_ev=ionpot_ev, J=J, epsilon=epsilon_2d[mask])
+            #            valid_Psec = v_Psec(e_p_2d[safe_eval_mask], epsilon=epsilon_2d[safe_eval_mask],ionpot_ev= ionpot_ev, J=J)
+            #            term1_full = np.zeros_like(e_p_2d)
+            #            term1_full[safe_eval_mask] = deltaen * self.yvec[k_idx[safe_eval_mask]] * ar_xs_array[k_idx[safe_eval_mask]] * valid_Psec
+            #            N_e_ion += np.sum(term1_full, axis=1)
+#
+            #    # --- Integral 2 (2E + I to E_max) ---
+            #    target_start_en2 = 2 * arr_en_nz + ionpot_ev
+            #    integral2startindices = np.searchsorted(self.engrid, target_start_en2, side='right') - 1
+            #    integral2startindices = np.maximum(0, integral2startindices)
+            #    
+            #    j_mask2 = j_indices[np.newaxis, :] >= integral2startindices[:, np.newaxis]
+            #    
+            #    if np.any(j_mask2):
+            #        e_p_2d = np.broadcast_to(self.engrid[np.newaxis, :], j_mask2.shape)
+            #        epsilon_2d = np.broadcast_to((arr_en_nz + ionpot_ev)[:, np.newaxis], j_mask2.shape)
+            #        
+            #        # CRITICAL FIX: Maintain consistency safeguard for the second integral limits
+            #        safe_eval_mask2 = j_mask2 & (e_p_2d > ionpot_ev)
+            #        
+            #        if np.any(safe_eval_mask2):
+            #            valid_Psec2 = v_Psec(e_p_2d[safe_eval_mask2], epsilon=epsilon_2d[safe_eval_mask2], ionpot_ev=ionpot_ev, J=J)
+            #            y_xs_2d = np.broadcast_to((self.yvec * ar_xs_array)[np.newaxis, :], j_mask2.shape)
+            #            
+            #            term2_full = np.zeros_like(e_p_2d)
+            #            term2_full[safe_eval_mask2] = deltaen * y_xs_2d[safe_eval_mask2] * valid_Psec2
+            #            N_e_ion += np.sum(term2_full, axis=1)
+            #            
+            #N_e_tot[nonzero_mask] += n_ion * N_e_ion
 
         return float(N_e_tot[0]) if is_scalar else N_e_tot
 #
