@@ -10,33 +10,38 @@ from pynonthermal.constants import EV
 from pynonthermal.constants import H
 from pynonthermal.constants import ME
 from pynonthermal.constants import QE
-from numba import njit
 
 DATADIR = Path(__file__).absolute().parent / "data"
 
-@njit(fastmath=True,cache=True)
-def jit_electronlossfunction(energy_ev: float, n_e_cgs: float) -> float:
-    if energy_ev <= 0:
-        return 0.0
+import numpy as np
+
+def electronlossfunction_vectorized(energy_ev_array: np.ndarray, n_e_cgs: float) -> np.ndarray:
+    """
+    Vectorized free-electron plasma loss rate calculation.
+    Accepts a numpy array of energies [eV] and returns an array of losses [eV/cm].
+    """
+    # Constants
+    energy_erg = energy_ev_array * EV
+    omegap = 5.64e4 * np.sqrt(n_e_cgs)
+    zetae = H * omegap / (2.0 * np.pi)
     
-    energy = energy_ev * EV
-    omegap = 5.64e4 * math.sqrt(n_e_cgs)
-    zetae = H * omegap / 2.0 / math.pi
-
-    if energy_ev > 14.0:
-        if 2.0 * energy <= zetae:
-            return 0.0
-        lossfunc = n_e_cgs * 2.0 * math.pi * (QE**4) / energy * math.log(2.0 * energy / zetae)
-    else:
-        v = math.sqrt(2.0 * energy / ME)
-        eulergamma = 0.577215664901532
-        val_inside_log = (ME * (v**3)) / (eulergamma * (QE**2) * omegap)
-        if val_inside_log <= 0:
-            return 0.0
-        lossfunc = n_e_cgs * 2.0 * math.pi * (QE**4) / energy * math.log(val_inside_log)
-
-    return lossfunc / EV
-
+    # Pre-calculate constant factor for the loss function
+    # factor = n_e * 2 * pi * QE^4
+    const_factor = n_e_cgs * 2.0 * np.pi * (QE**4)
+    
+    # 1. High-energy branch (energy_ev > 14)
+    # Using np.log for array compatibility
+    loss_high = const_factor / energy_erg * np.log(2.0 * energy_erg / zetae)
+    
+    # 2. Low-energy branch (energy_ev <= 14)
+    v = np.sqrt(2.0 * energy_erg / ME)
+    eulergamma = 0.577215664901532
+    # Log argument: (ME * v^3) / (eulergamma * QE^2 * omegap)
+    log_arg = (ME * (v**3)) / (eulergamma * (QE**2) * omegap)
+    loss_low = const_factor / energy_erg * np.log(log_arg)
+    
+    # Use np.where to combine both branches based on the energy condition
+    return np.where(energy_ev_array > 14.0, loss_high, loss_low) / EV
 
 def electronlossfunction(energy_ev: float, n_e_cgs: float) -> float:
     # free-electron plasma loss rate (as in Kozma & Fransson 1992)
