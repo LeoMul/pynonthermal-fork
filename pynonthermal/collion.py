@@ -36,7 +36,6 @@ def get_nist_ionization_energies_ev() -> dict[tuple[int, int], float]:
         for atomic_number, ion_stage, ioniz_ev in dfnist.select(["Z", "ion_stage", "ioniz_ev"]).iter_rows(named=False)
     }
 
-
 def read_colliondata(collionfilename: str | Path = "collion.txt") -> pl.DataFrame:
     dfcollion = pl.read_csv(
         Path(pynonthermal.DATADIR, collionfilename),
@@ -57,59 +56,64 @@ def read_colliondata(collionfilename: str | Path = "collion.txt") -> pl.DataFram
         },
     )
 
+    # CRITICAL OPTIMIZATION: Extract existing pairs into a fast-lookup set.
+    # This completely eliminates thousands of slow Polars dataframe scans.
+    existing_pairs = set(
+        dfcollion.select(["Z", "nelec"]).iter_rows()
+    )
+
     nist_ionisation_energies_ev = get_nist_ionization_energies_ev()
     elements_electron_binding = get_binding_energies()
     all_shells_q = get_shell_configs()
     new_rows: list[dict[str, int | float]] = []
+    
     for Z in range(1, len(elements_electron_binding)):
         for ionstage in range(1, Z + 1):
-            any_data_matched = (
-                dfcollion.filter(pl.col("Z") == Z).filter(pl.col("nelec") == (Z - ionstage + 1)).height > 0
-            )
+            target_nelec = Z - ionstage + 1
+            
+            # O(1) Instant Hash Lookup instead of .filter().height > 0
+            if (Z, target_nelec) in existing_pairs:
+                continue
 
-            if not any_data_matched:
-                ioncharge = ionstage - 1
-                nbound = Z - ioncharge  # number of bound electrons
-                if nbound <= 0:
+            ioncharge = ionstage - 1
+            nbound = Z - ioncharge  # number of bound electrons
+            if nbound <= 0:
+                continue
+
+            try:
+                ion_shells_q = all_shells_q[Z - 1]
+                ionpot = nist_ionisation_energies_ev[(Z, ionstage)] * EV
+            except (KeyError, IndexError):
+                continue
+
+            electron_count = 0
+            for shellindex in range(len(ion_shells_q)):
+                electronsinshell = ion_shells_q[shellindex]
+                electron_count += electronsinshell
+
+                if electronsinshell <= 0:
                     continue
+                enbinding = elements_electron_binding[Z - 1][shellindex]
+                if enbinding <= 0:
+                    enbinding = elements_electron_binding[Z - 1][shellindex - 1]
+                    assert enbinding > 0
 
-                # ion_shells_q = get_shell_occupancies(Z, ionstage, elements_electron_binding, all_shells_q)
-                try:
-                    ion_shells_q = all_shells_q[Z - 1]
-                    ionpot = nist_ionisation_energies_ev[(Z, ionstage)] * EV
-                except (KeyError, IndexError):
-                    continue
+                p = max(ionpot, enbinding)
+                collionrow: dict[str, int | float] = {
+                    "Z": Z,
+                    "nelec": target_nelec,
+                    "n": -1,
+                    "l": -shellindex,
+                    "ionpot_ev": p / EV,
+                    "A": -1.0,
+                    "B": -1.0,
+                    "C": -1.0,
+                    "D": -1.0,
+                }
 
-                electron_count = 0
-                for shellindex in range(len(ion_shells_q)):
-                    electronsinshell = ion_shells_q[shellindex]
-
-                    electron_count += electronsinshell
-
-                    if electronsinshell <= 0:
-                        continue
-                    enbinding = elements_electron_binding[Z - 1][shellindex]
-                    if enbinding <= 0:
-                        # if we don't have the shell's binding energy, use the previous one
-                        enbinding = elements_electron_binding[Z - 1][shellindex - 1]
-                        assert enbinding > 0
-
-                    p = max(ionpot, enbinding)
-                    collionrow: dict[str, int | float] = {
-                        "Z": Z,
-                        "nelec": Z - ionstage + 1,
-                        "n": -1,
-                        "l": -shellindex,
-                        "ionpot_ev": p / EV,
-                        "A": -1.0,
-                        "B": -1.0,
-                        "C": -1.0,
-                        "D": -1.0,
-                    }
-
-                    new_rows.append(collionrow)
-                    if electron_count >= nbound:
-                        break
+                new_rows.append(collionrow)
+                if electron_count >= nbound:
+                    break
 
     # Append Lotz approximate cross sections to the Arnaud/Rothenflug data
     return (
@@ -117,6 +121,87 @@ def read_colliondata(collionfilename: str | Path = "collion.txt") -> pl.DataFram
         .with_columns(ion_stage=pl.col("Z") - pl.col("nelec") + 1)
         .sort(by=["Z", "ion_stage", "ionpot_ev", "n", "l"])
     )
+
+#def read_colliondata(collionfilename: str | Path = "collion.txt") -> pl.DataFrame:
+#    dfcollion = pl.read_csv(
+#        Path(pynonthermal.DATADIR, collionfilename),
+#        separator=" ",
+#        has_header=False,
+#        skip_lines=1,
+#        truncate_ragged_lines=True,
+#        schema={
+#            "Z": pl.Int64,
+#            "nelec": pl.Int64,
+#            "n": pl.Int64,
+#            "l": pl.Int64,
+#            "ionpot_ev": pl.Float64,
+#            "A": pl.Float64,
+#            "B": pl.Float64,
+#            "C": pl.Float64,
+#            "D": pl.Float64,
+#        },
+#    )
+#
+#    nist_ionisation_energies_ev = get_nist_ionization_energies_ev()
+#    elements_electron_binding = get_binding_energies()
+#    all_shells_q = get_shell_configs()
+#    new_rows: list[dict[str, int | float]] = []
+#    for Z in range(1, len(elements_electron_binding)):
+#        for ionstage in range(1, Z + 1):
+#            any_data_matched = (
+#                dfcollion.filter(pl.col("Z") == Z).filter(pl.col("nelec") == (Z - ionstage + 1)).height > 0
+#            )
+#
+#            if not any_data_matched:
+#                ioncharge = ionstage - 1
+#                nbound = Z - ioncharge  # number of bound electrons
+#                if nbound <= 0:
+#                    continue
+#
+#                # ion_shells_q = get_shell_occupancies(Z, ionstage, elements_electron_binding, all_shells_q)
+#                try:
+#                    ion_shells_q = all_shells_q[Z - 1]
+#                    ionpot = nist_ionisation_energies_ev[(Z, ionstage)] * EV
+#                except (KeyError, IndexError):
+#                    continue
+#
+#                electron_count = 0
+#                for shellindex in range(len(ion_shells_q)):
+#                    electronsinshell = ion_shells_q[shellindex]
+#
+#                    electron_count += electronsinshell
+#
+#                    if electronsinshell <= 0:
+#                        continue
+#                    enbinding = elements_electron_binding[Z - 1][shellindex]
+#                    if enbinding <= 0:
+#                        # if we don't have the shell's binding energy, use the previous one
+#                        enbinding = elements_electron_binding[Z - 1][shellindex - 1]
+#                        assert enbinding > 0
+#
+#                    p = max(ionpot, enbinding)
+#                    collionrow: dict[str, int | float] = {
+#                        "Z": Z,
+#                        "nelec": Z - ionstage + 1,
+#                        "n": -1,
+#                        "l": -shellindex,
+#                        "ionpot_ev": p / EV,
+#                        "A": -1.0,
+#                        "B": -1.0,
+#                        "C": -1.0,
+#                        "D": -1.0,
+#                    }
+#
+#                    new_rows.append(collionrow)
+#                    if electron_count >= nbound:
+#                        break
+#
+#    # Append Lotz approximate cross sections to the Arnaud/Rothenflug data
+#    return (
+#        pl.concat([dfcollion, pl.DataFrame(new_rows)])
+#        .with_columns(ion_stage=pl.col("Z") - pl.col("nelec") + 1)
+#        .sort(by=["Z", "ion_stage", "ionpot_ev", "n", "l"])
+#    )
 
 
 def Psecondary(e_p: float, ionpot_ev: float, J: float, e_s: float = -1, epsilon: float = -1) -> float:
